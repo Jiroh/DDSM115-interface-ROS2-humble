@@ -1,4 +1,5 @@
 //ddsm115 ros2
+#include <cstdint>
 #include <micro_ros_arduino.h>
 #include <micro_ros_platformio.h>
 #include <M5Unified.h>
@@ -8,9 +9,11 @@
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
+#include <rmw_microros/rmw_microros.h>
 #include "keys.h"
 #include <geometry_msgs/msg/twist.h>
 #include <FastLED.h>
+#include <std_msgs/msg/int32.h>
 
 //assign stop pin #1
 const uint8_t stop_button_pin1 = 1;
@@ -28,28 +31,37 @@ unsigned char sendbuf[32];
 unsigned long pre_time;
 String mode;
 
-rcl_subscription_t subscriber;
-geometry_msgs__msg__Twist msg;
-rclc_executor_t executor;
-rcl_allocator_t allocator;
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){}}
+#define EXECUTE_EVERY_N_MS(MS, X)  do { \
+  static volatile int64_t init = -1; \
+  if (init == -1) { init = uxr_millis();} \
+  if (uxr_millis() - init > MS) { X; init = uxr_millis();} \
+} while (0)\
+
+
 rclc_support_t support;
 rcl_node_t node;
+rcl_timer_t timer;
+rclc_executor_t executor;
+rcl_allocator_t allocator;
+rcl_subscription_t subscriber;
+geometry_msgs__msg__Twist msg;
+bool micro_ros_init_successful;
+
+enum states {
+  WAITING_AGENT,
+  AGENT_AVAILABLE,
+  AGENT_CONNECTED,
+  AGENT_DISCONNECTED
+} state;
 
 const int watch_dog_msec = 1000;
 int last_control_msec = 0;
 
-#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){error_loop();}}
-#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){}}
-
-void error_loop()
+void timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 {
-  while (1)
-  {
-    Serial.printf("error_loop\n");
-    delay(1);
-  }
+  RCLC_UNUSED(last_call_time); 
 }
-
 
 double w_r=0, w_l=0;
 //wheel_rad is the wheel radius ,wheel_sep is
@@ -57,6 +69,77 @@ double wheel_rad = 0.100, wheel_sep = 0.235;
 int lowSpeed = 200;
 int highSpeed = 50;
 double speed_ang=0, speed_lin=0;
+
+// twist message cb
+
+void subscription_callback(const void *msgin)
+{
+  const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msgin;  
+  const float speed_ang = (msg->angular.z);
+  const float speed_lin = (msg->linear.x);
+  w_r = ((speed_lin/(wheel_rad)) + ((speed_ang*wheel_sep)/(2.0*wheel_rad)))*-5;
+  w_l = ((speed_lin/(wheel_rad)) - ((speed_ang*wheel_sep)/(2.0*wheel_rad)))*5;  
+  //USBSerial.printf("%f, %f\n", msg->linear.x, msg->angular.z);
+  //USBSerial.printf("%f, %f\n", w_r, w_l);
+  last_control_msec = millis();
+}
+
+// Functions create_entities and destroy_entities can take several seconds.
+// In order to reduce this rebuild the library with
+// - RMW_UXRCE_ENTITY_CREATION_DESTROY_TIMEOUT=0
+// - UCLIENT_MAX_SESSION_CONNECTION_ATTEMPTS=3
+
+bool create_entities()
+{
+  allocator = rcl_get_default_allocator();
+
+  // create init_options
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+
+  // create node
+  RCCHECK(rclc_node_init_default(&node, "micro_ros_arduino_node", "", &support));
+
+  // create subscriber
+  RCCHECK(rclc_subscription_init_default(
+      &subscriber,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+      "cmd_vel")); //"micro_ros_arduino_twist_subscriber"));
+  
+
+  // create timer,
+  const unsigned int timer_timeout = 1000;
+  RCCHECK(rclc_timer_init_default(
+    &timer,
+    &support,
+    RCL_MS_TO_NS(timer_timeout),
+    timer_callback));
+
+
+
+  // create executor
+  executor = rclc_executor_get_zero_initialized_executor();
+  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &msg, &subscription_callback, ON_NEW_DATA));
+  return true;
+}
+
+void destroy_entities()
+{
+  rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+  (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+  //rcl_publisher_fini(&publisher, &node);
+  rcl_timer_fini(&timer);
+  rclc_executor_fini(&executor);
+  rcl_node_fini(&node);
+  rclc_support_fini(&support);
+  RCCHECK(rcl_subscription_fini(&subscriber, &node));
+}
+
+
+
+
 
 // CRC8 lookup table
 const uint8_t CRC8Table[256] = {
@@ -90,18 +173,6 @@ uint8_t crc8(const uint8_t* data, uint8_t len) {
 
 
 
-// twist message cb
-void subscription_callback(const void *msgin)
-{
-  const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msgin;  
-  const float speed_ang = (msg->angular.z);
-  const float speed_lin = (msg->linear.x);
-  w_r = ((speed_lin/(wheel_rad)) + ((speed_ang*wheel_sep)/(2.0*wheel_rad)))*-5;
-  w_l = ((speed_lin/(wheel_rad)) - ((speed_ang*wheel_sep)/(2.0*wheel_rad)))*5;  
-  //USBSerial.printf("%f, %f\n", msg->linear.x, msg->angular.z);
-  //USBSerial.printf("%f, %f\n", w_r, w_l);
-  last_control_msec = millis();
-}
 
 
 
@@ -121,25 +192,9 @@ void setup()
   FastLED.addLeds<WS2812B, PIN_LED, GRB>(leds, NUM_LEDS);
   leds[0] = CRGB(40, 40, 40);
   
-  // micro-ros
-  allocator = rcl_get_default_allocator();
-
-  // create init_options
-  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-
-  // create node
-  RCCHECK(rclc_node_init_default(&node, "micro_ros_arduino_node", "", &support));
-
-  // create subscriber
-  RCCHECK(rclc_subscription_init_default(
-      &subscriber,
-      &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
-      "cmd_vel"));
-
-  // create executor
-  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
-  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &msg, &subscription_callback, ON_NEW_DATA));
+  // agent
+  state = WAITING_AGENT;
+  //msg.data = 0;
   
   //pin mode
   pinMode(stop_button_pin1, INPUT_PULLUP);
@@ -184,7 +239,35 @@ void setup()
 
 void loop()
 {
+    switch (state) {
+    case WAITING_AGENT:
+      EXECUTE_EVERY_N_MS(500, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_AVAILABLE : WAITING_AGENT;);
+      break;
+    case AGENT_AVAILABLE:
+      state = (true == create_entities()) ? AGENT_CONNECTED : WAITING_AGENT;
+      if (state == WAITING_AGENT) {
+        destroy_entities();
+      };
+      break;
+    case AGENT_CONNECTED:
+      EXECUTE_EVERY_N_MS(200, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_CONNECTED : AGENT_DISCONNECTED;);
+      if (state == AGENT_CONNECTED) {
+        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
+      }
+      break;
+    case AGENT_DISCONNECTED:
+      destroy_entities();
+      state = WAITING_AGENT;
+            break;
 
+        default:
+            break;
+
+
+            
+    }
+
+    
   // Check for emergency stop button press
   if (digitalRead(stop_button_pin1) == LOW) {
      mode = "stop";
@@ -195,7 +278,7 @@ void loop()
      else {
      mode = "run";
      USBSerial.printf("run mode");
-     leds[0] = CRGB::Blue;
+     leds[0] = CRGB::Green;
      FastLED.show();    
      
     }
